@@ -41,6 +41,5 @@ The script will start browsing organizations and updating the database.
 *   `requirements.txt`: List of required Python dependencies.
 *   `start_importer.sh`: Shell script to easily launch the importer.
 *   `sc_organizations.db`: SQLite database containing current organization information.
-*   `corporation_history.db`: SQLite database containing the history of organization changes.
 *   `sc_org_importer.log`: Log file recording the script's activity.
 
