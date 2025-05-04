@@ -693,6 +693,40 @@ class DatabaseManager:
             logger.error(f"Error retrieving current members of organization {org_id}: {e}")
             raise
 
+    def get_all_member_symbols(self) -> Dict[str, int]:
+        """Retrieves all member symbols and their IDs from the database.
+
+        Returns:
+            Dictionary mapping member symbol to member ID.
+        """
+        try:
+            self.cursor.execute("SELECT id, symbol FROM members")
+            return {row['symbol']: row['id'] for row in self.cursor.fetchall()}
+        except sqlite3.Error as e:
+            logger.error(f"Error retrieving all member symbols: {e}")
+            raise
+
+    def get_active_org_members_with_rank(self, org_id: int) -> Dict[int, Tuple[str, int]]:
+        """Retrieves active members, their ranks, and association IDs for a specific organization.
+
+        Args:
+            org_id: The organization ID.
+
+        Returns:
+            Dictionary mapping member ID to a tuple of (current rank, association ID).
+        """
+        try:
+            self.cursor.execute("""
+                SELECT id, member_id, rank
+                FROM member_organization
+                WHERE organization_id = ? AND is_active = 1
+            """, (org_id,))
+            # Map member_id -> (rank, association_id)
+            return {row['member_id']: (row['rank'], row['id']) for row in self.cursor.fetchall()}
+        except sqlite3.Error as e:
+            logger.error(f"Error retrieving active members for organization {org_id}: {e}")
+            raise
+
     def get_member_name(self, member_id: int) -> str:
         """Retrieves a member's name from their ID.
 
@@ -713,6 +747,154 @@ class DatabaseManager:
         except sqlite3.Error as e:
             logger.error(f"Error retrieving name for member {member_id}: {e}")
             return ""
+
+    # --- Batch Operations --- #
+
+    def batch_insert_members(self, members_to_insert: List[Member]) -> Dict[str, int]:
+        """Inserts multiple new members in a batch.
+
+        Args:
+            members_to_insert: List of Member objects to insert.
+
+        Returns:
+            Dictionary mapping symbol to newly inserted member ID.
+        """
+        if not members_to_insert:
+            return {}
+
+        new_member_ids = {}
+        try:
+            data = [
+                (m.name, m.symbol, m.url_image, m.url_member)
+                for m in members_to_insert
+            ]
+            self.cursor.executemany("""
+                INSERT INTO members (name, symbol, url_image, url_member)
+                VALUES (?, ?, ?, ?)
+            """, data)
+
+            # Retrieve IDs for the inserted members (less efficient, but needed)
+            # Assumes symbols are unique and were just inserted
+            symbols = [m.symbol for m in members_to_insert]
+            # Create placeholders for the IN clause
+            placeholders = ', '.join('?' * len(symbols))
+            self.cursor.execute(f"SELECT id, symbol FROM members WHERE symbol IN ({placeholders})", symbols)
+            new_member_ids = {row['symbol']: row['id'] for row in self.cursor.fetchall()}
+            logger.debug(f"Batch inserted {len(data)} new members.")
+            return new_member_ids
+        except sqlite3.Error as e:
+            logger.error(f"Error batch inserting members: {e}")
+            raise # Re-raise to trigger rollback
+
+    def batch_update_members(self, members_to_update: List[Member]) -> None:
+        """Updates multiple existing members in a batch.
+
+        Args:
+            members_to_update: List of Member objects with IDs to update.
+        """
+        if not members_to_update:
+            return
+
+        try:
+            data = [
+                (m.name, m.url_image, m.url_member, m.id)
+                for m in members_to_update
+            ]
+            self.cursor.executemany("""
+                UPDATE members SET
+                name = ?, url_image = ?, url_member = ?, last_updated = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, data)
+            logger.debug(f"Batch updated {len(data)} members.")
+        except sqlite3.Error as e:
+            logger.error(f"Error batch updating members: {e}")
+            raise # Re-raise to trigger rollback
+
+    def batch_insert_associations(self, associations_to_insert: List[Tuple[int, int, str]]) -> None:
+        """Inserts multiple new member-organization associations.
+
+        Args:
+            associations_to_insert: List of tuples (member_id, org_id, rank).
+        """
+        if not associations_to_insert:
+            return
+
+        try:
+            self.cursor.executemany("""
+                INSERT INTO member_organization (member_id, organization_id, rank)
+                VALUES (?, ?, ?)
+            """, associations_to_insert)
+            logger.debug(f"Batch inserted {len(associations_to_insert)} new associations.")
+        except sqlite3.Error as e:
+            # Handle potential UNIQUE constraint violations if logic has overlap
+            if "UNIQUE constraint failed" in str(e):
+                logger.warning(f"Attempted to insert duplicate active associations: {e}")
+            else:
+                logger.error(f"Error batch inserting associations: {e}")
+                raise # Re-raise to trigger rollback
+
+    def batch_update_associations_rank(self, associations_to_update: List[Tuple[str, int]]) -> None:
+        """Updates the rank for multiple existing member-organization associations.
+
+        Args:
+            associations_to_update: List of tuples (new_rank, association_id).
+        """
+        if not associations_to_update:
+            return
+
+        try:
+            self.cursor.executemany("""
+                UPDATE member_organization SET rank = ?
+                WHERE id = ?
+            """, associations_to_update)
+            logger.debug(f"Batch updated rank for {len(associations_to_update)} associations.")
+        except sqlite3.Error as e:
+            logger.error(f"Error batch updating association ranks: {e}")
+            raise # Re-raise to trigger rollback
+
+    def batch_insert_rank_history(self, rank_history_to_insert: List[Tuple[int, int, str]]) -> None:
+        """Inserts multiple rank history entries.
+
+        Args:
+            rank_history_to_insert: List of tuples (member_id, org_id, rank).
+        """
+        if not rank_history_to_insert:
+            return
+
+        try:
+            self.cursor.executemany("""
+                INSERT INTO member_rank_history (member_id, organization_id, rank)
+                VALUES (?, ?, ?)
+            """, rank_history_to_insert)
+            logger.debug(f"Batch inserted {len(rank_history_to_insert)} rank history entries.")
+        except sqlite3.Error as e:
+            logger.error(f"Error batch inserting rank history: {e}")
+            raise # Re-raise to trigger rollback
+
+    def batch_mark_departures(self, departing_member_ids: List[int], org_id: int) -> None:
+        """Marks multiple members as having left an organization.
+
+        Args:
+            departing_member_ids: List of member IDs that have left.
+            org_id: The organization ID they left.
+        """
+        if not departing_member_ids:
+            return
+
+        try:
+            data = [(org_id, member_id) for member_id in departing_member_ids]
+            result = self.cursor.executemany("""
+                UPDATE member_organization SET
+                is_active = 0, left_at = CURRENT_TIMESTAMP
+                WHERE organization_id = ? AND member_id = ? AND is_active = 1
+            """, data)
+            # Note: executemany doesn't reliably return rowcount in older sqlite versions
+            logger.debug(f"Attempted to mark {len(departing_member_ids)} members as departed from org {org_id}.")
+        except sqlite3.Error as e:
+            logger.error(f"Error batch marking departures for org {org_id}: {e}")
+            raise # Re-raise to trigger rollback
+
+    # --- End Batch Operations --- #
 
 
 class RSIApiClient:
@@ -910,7 +1092,7 @@ class RSIApiClient:
         total_rows = response['data']['totalrows']
         total_pages = ceil(total_rows / 32)
 
-        members = await self._parse_members_page(response['data']['html'])
+        members = await self._parse_members_page(response['data']['html'], symbol) # Pass symbol here
 
         # Retrieve additional pages
         for page in range(2, total_pages + 1):
@@ -918,65 +1100,77 @@ class RSIApiClient:
             page_response = await self._make_request("orgs/getOrgMembers", data)
 
             if not page_response or 'data' not in page_response or 'html' not in page_response['data']:
-                logger.error(f"Error retrieving page {page} of members")
+                logger.error(f"Error retrieving page {page} of members for org '{symbol}'") # Added org symbol here too for context
                 continue
 
-            page_members = await self._parse_members_page(page_response['data']['html'])
+            page_members = await self._parse_members_page(page_response['data']['html'], symbol) # Pass symbol here too
             members.extend(page_members)
 
         return (members, total_rows)
 
-    async def _parse_members_page(self, html: str) -> List[Member]:
+    async def _parse_members_page(self, html: str, org_symbol: str) -> List[Member]: # Add org_symbol parameter
         """Parses an HTML page of members.
 
         Args:
             html: HTML content to parse.
+            org_symbol: The symbol of the organization being parsed.
 
         Returns:
             List of members extracted from the page.
         """
         members = []
         soup = BeautifulSoup(html, "lxml")
-        member_cards = soup.find_all("a", {"class": "membercard js-edit-member"})
+        member_items = soup.find_all("li", class_="member-item")
 
-        for card in member_cards:
+        if not member_items:
+            member_items = soup.find_all("a", class_="membercard")
+
+        for item in member_items:
             try:
-                url_member = card.get('href', "")
-                if url_member:
+                card = item if item.name == 'a' else item.find("a", class_="membercard")
+                if not card:
+                    continue
+
+                # --- Extract URL ---
+                url_member = card.get('href', '')
+                if url_member and url_member.startswith('/'):
                     url_member = f"https://robertsspaceindustries.com{url_member}"
+                # --- End Extract URL ---
 
-                img_tag = card.find("img")
-                img_member = img_tag['src'] if img_tag else ""
+                # --- Extract Image URL ---
+                img_tag = card.find("span", class_="thumb").find("img") if card.find("span", class_="thumb") else None
+                url_image = img_tag.get('src', '') if img_tag else ""
+                if url_image and url_image.startswith('/'):
+                    url_image = f"https://robertsspaceindustries.com{url_image}"
+                # --- End Extract Image URL ---
 
-                name_wrap = card.find("span", {"class": "name-wrap"})
+                name_wrap = card.find("span", class_="name-wrap")
                 if not name_wrap:
                     continue
 
-                name_wrap_soup = BeautifulSoup(str(name_wrap), "lxml")
-                spans = name_wrap_soup.find_all("span")
+                name_tag = name_wrap.find("span", class_="name")
+                handle_tag = name_wrap.find("span", class_="nick")
+                rank_tag = card.find("span", class_="rank")
 
-                if len(spans) < 3:
+                name = name_tag.text.replace('\u00a0', ' ').strip() if name_tag else "UNKNOWN_NAME"
+                handle = handle_tag.text.replace('\u00a0', ' ').strip() if handle_tag else "UNKNOWN_HANDLE"
+                rank = rank_tag.text.replace('\u00a0', ' ').strip() if rank_tag else "N/A"
+
+                if not name or name.isspace() or not handle or handle.isspace() or handle == "UNKNOWN_HANDLE":
                     continue
-
-                name = spans[1].text
-                handle = spans[2].text
-
-                rank_tag = card.find("span", {"class": "rank"})
-                rank = rank_tag.text if rank_tag else "N/A"
 
                 member = Member(
                     name=name,
-                    symbol=handle,
-                    url_image=img_member,
+                    symbol=handle, # Handle is the symbol
+                    url_image=url_image,
                     url_member=url_member,
                     rank=rank
                 )
-
                 members.append(member)
 
             except Exception as e:
-                logger.error(f"Error parsing a member card: {e}")
-                continue
+                logger.error(f"Error parsing a member card for org '{org_symbol}': {e}. Card HTML: {item}", exc_info=True) # Added org symbol here too
+                continue # Continue with the next card
 
         return members
 
@@ -1057,58 +1251,146 @@ class OrganizationImporter:
                     logger.error(f"Error updating organization {org_data['symbol']}: {e}")
 
     async def import_members(self, session: aiohttp.ClientSession) -> None:
-        """Imports members of organizations.
-
-        Args:
-            session: aiohttp session to use for requests.
-        """
+        """Imports members of organizations using optimized batch processing."""
         api_client = RSIApiClient(session)
         orgs_for_members = self.db_manager.get_organizations_for_member_update()
 
-        logger.info(f"Importing members for {len(orgs_for_members)} organizations")
+        logger.info(f"Optimized member import starting for {len(orgs_for_members)} organizations")
 
-        for org_data in tqdm(orgs_for_members, desc="Importing members"):
+        # Pre-fetch all existing member symbols and IDs once (can consume memory for large member tables)
+        # Consider fetching within the loop if memory becomes an issue
+        try:
+            all_member_symbols = self.db_manager.get_all_member_symbols()
+            logger.info(f"Pre-fetched {len(all_member_symbols)} existing member symbols.")
+        except Exception as e:
+            logger.error(f"Failed to pre-fetch member symbols: {e}. Aborting member import.")
+            return
+
+        for org_data in tqdm(orgs_for_members, desc="Importing members (Optimized)"):
+            org_id = org_data['id']
+            org_symbol = org_data['symbol']
+            logger.debug(f"Processing members for {org_symbol} (ID: {org_id})")
+
             try:
-                org_id = org_data['id']
-                symbol = org_data['symbol']
+                # Pre-fetch current active members and ranks for THIS organization
+                active_org_members = self.db_manager.get_active_org_members_with_rank(org_id)
+                logger.debug(f"Pre-fetched {len(active_org_members)} active members for {org_symbol}.")
 
-                result = await api_client.get_organization_members(symbol)
+                # Fetch members from API
+                result = await api_client.get_organization_members(org_symbol)
                 if not result:
+                    logger.warning(f"Could not retrieve members for {org_symbol} from API. Skipping.")
                     continue
 
-                members, total = result
-                logger.info(f"Organization {symbol}: {len(members)}/{total} members retrieved")
+                api_members, total = result
+                logger.info(f"Organization {org_symbol}: {len(api_members)}/{total} members retrieved from API")
 
-                # Get current members to detect departures
-                current_members = self.db_manager.get_current_members(org_id)
-                retrieved_members = set()
+                # --- Prepare lists for batch operations --- #
+                members_to_insert = [] # List of Member objects
+                members_to_update = [] # List of Member objects with existing ID
+                associations_to_insert = [] # List of tuples (member_id, org_id, rank)
+                associations_to_update = [] # List of tuples (rank, association_id_to_update)
+                rank_history_to_insert = [] # List of tuples (member_id, org_id, rank)
+                retrieved_member_symbols = set()
+                processed_member_ids = set()
 
-                for member in members:
-                    # Save the member
-                    member_id = self.db_manager.save_member(member)
+                # --- Process members retrieved from API --- #
+                for api_member in api_members:
+                    retrieved_member_symbols.add(api_member.symbol)
+                    member_id = None
+                    is_new_member = False
 
-                    # Save the member-organization association
-                    self.db_manager.save_member_organization(member_id, org_id, member.rank)
+                    # Check if member exists in our global list
+                    if api_member.symbol in all_member_symbols:
+                        member_id = all_member_symbols[api_member.symbol]
+                        api_member.id = member_id # Assign existing ID
+                        members_to_update.append(api_member)
+                        processed_member_ids.add(member_id)
+                    else:
+                        # Member is new to the database
+                        is_new_member = True
+                        members_to_insert.append(api_member)
+                        # We need the ID after insertion for association, handle this later
 
-                    # Track retrieved members
-                    retrieved_members.add(member.symbol)
+                    # Check association and rank (only if member ID is known)
+                    if member_id is not None:
+                        association_data = active_org_members.get(member_id)
 
-                # Detect members who have left the organization
-                for symbol, member_id in current_members.items():
-                    if symbol not in retrieved_members:
-                        # Get member name
-                        member_name = self.db_manager.get_member_name(member_id)
-                        if not member_name:
-                            member_name = symbol  # Use symbol if name is not available
+                        if association_data is None:
+                            # Member exists but wasn't active in this org -> new association
+                            associations_to_insert.append((member_id, org_id, api_member.rank))
+                            rank_history_to_insert.append((member_id, org_id, api_member.rank))
+                        else:
+                            current_rank, association_id = association_data
+                            if current_rank != api_member.rank:
+                                # Member is active, rank changed
+                                logger.info(f"Rank change for {api_member.symbol} in {org_symbol}: {current_rank} -> {api_member.rank}")
+                                associations_to_update.append((api_member.rank, association_id)) # Use the fetched association_id
+                                rank_history_to_insert.append((member_id, org_id, api_member.rank))
+                            # else: Member active, rank unchanged - do nothing for association/history
 
-                        logger.info(f"Member '{member_name}' (ID: {member_id}, Symbol: {symbol}) left organization {org_data['symbol']}")
-                        self.db_manager.mark_member_left_organization(member_id, org_id)
+                # --- Determine Departures --- #
+                departing_member_ids = []
+                for member_id, (rank, assoc_id) in active_org_members.items(): # Unpack tuple here
+                    if member_id not in processed_member_ids:
+                        departing_member_ids.append(member_id)
+                        # Optionally log departure here
+                        # logger.info(f"Member ID {member_id} left {org_symbol}")
 
-                # Mark the organization as updated
-                self.db_manager.mark_organization_members_updated(org_id)
+                # --- Perform Batch DB Operations within a Transaction --- #
+                try:
+                    self.db_manager.connection.execute("BEGIN TRANSACTION")
+                    logger.debug(f"Beginning transaction for {org_symbol}")
+
+                    # 1. Batch insert new members
+                    newly_inserted_ids = self.db_manager.batch_insert_members(members_to_insert)
+                    if newly_inserted_ids:
+                        # Update global symbol map
+                        all_member_symbols.update(newly_inserted_ids)
+                        # Prepare associations and history for newly inserted members
+                        for member_obj in members_to_insert:
+                            new_id = newly_inserted_ids.get(member_obj.symbol)
+                            if new_id:
+                                associations_to_insert.append((new_id, org_id, member_obj.rank))
+                                rank_history_to_insert.append((new_id, org_id, member_obj.rank))
+                            else:
+                                logger.warning(f"Could not find newly inserted ID for symbol {member_obj.symbol}")
+
+                    # 2. Batch update existing members
+                    self.db_manager.batch_update_members(members_to_update)
+
+                    # 3. Batch insert new associations (now includes those for new members)
+                    self.db_manager.batch_insert_associations(associations_to_insert)
+
+                    # 4. Batch update existing associations rank
+                    self.db_manager.batch_update_associations_rank(associations_to_update)
+
+                    # 5. Batch insert rank history (now includes those for new members)
+                    self.db_manager.batch_insert_rank_history(rank_history_to_insert)
+
+                    # 6. Batch mark departures
+                    self.db_manager.batch_mark_departures(departing_member_ids, org_id)
+
+                    # 7. Mark organization members as updated
+                    self.db_manager.mark_organization_members_updated(org_id)
+
+                    # 8. Commit Transaction
+                    self.db_manager.connection.commit()
+                    logger.debug(f"Committed transaction for {org_symbol}")
+
+                except Exception as db_error:
+                    logger.error(f"Database error during batch processing for {org_symbol}: {db_error}", exc_info=True)
+                    self.db_manager.connection.rollback()
+                    logger.warning(f"Rolled back transaction for {org_symbol}")
+                    # Do not skip the org, just log the error and continue to the next
+
+                # --- End Batch DB Operations --- #
 
             except Exception as e:
-                logger.error(f"Error importing members for {org_data['symbol']}: {e}")
+                logger.error(f"Error importing members for {org_symbol}: {e}", exc_info=True)
+                # No transaction to rollback here as it's handled in the inner try/except
+
+        logger.info("Finished optimized member import cycle.")
 
     async def run_import_cycle(self) -> None:
         """Runs a full import cycle."""
